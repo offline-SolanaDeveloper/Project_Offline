@@ -1,1 +1,148 @@
 # Project_Offline
+import os
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import random
+import threading
+import queue
+
+# --- 1. Offline Model Loading ---
+# Choose a smaller, manageable model (e.g., GPT-2, smaller Llama variants)
+
+MODEL_NAME = "gpt2"  # Or try "facebook/opt-125m", "EleutherAI/pythia-70m"
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+except Exception as e:
+    print(f"Error loading model: {e}.  Make sure you have enough disk space"
+          f" and internet to download the model on the first run, or manually download"
+          f" the model and tokenizer to a local directory, then specify `local_files_only=True`")
+    raise
+
+# Move model to GPU if available
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+model.eval()  # Set to evaluation mode
+
+print(f"Model loaded on device: {device}")
+
+
+# --- 2. Text Generation Function ---
+
+def generate_text(prompt, max_length=150, temperature=0.7, num_return_sequences=1):
+    """Generates text using the loaded model."""
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            temperature=temperature,
+            num_return_sequences=num_return_sequences,
+            pad_token_id=tokenizer.eos_token_id  # Avoid warning
+        )
+
+    generated_texts = [tokenizer.decode(output[i], skip_special_tokens=True) for i in range(num_return_sequences)]
+    return generated_texts
+
+
+# --- 3. Agent Definition (Example: Question Answering Agent) ---
+
+class Agent:
+    def __init__(self, name, role, knowledge_base=None, personality="helpful and concise"):
+        self.name = name
+        self.role = role
+        self.knowledge_base = knowledge_base  # Placeholder for local knowledge (e.g., a dictionary or text file)
+        self.personality = personality
+        self.memory = []  # Keep track of agent's interactions
+
+    def generate_prompt(self, user_input, conversation_history=""):
+        """Creates a prompt tailored to the agent's role and personality."""
+        prompt = f"You are {self.name}, an AI {self.role} with a {self.personality} personality.\n"
+        if self.knowledge_base:
+            prompt += f"You have access to the following information: {self.knowledge_base}\n" # Keep this concise.
+        if conversation_history:
+            prompt += "Here is the previous conversation:\n" + conversation_history + "\n"
+        prompt += f"User: {user_input}\n{self.name}:"
+        return prompt
+
+    def respond(self, user_input, conversation_history=""):
+        """Generates a response based on the user input and the agent's prompt."""
+        prompt = self.generate_prompt(user_input, conversation_history)
+        response = generate_text(prompt)[0]  # Get the first generated text
+        self.memory.append(f"User: {user_input}\n{self.name}: {response}")  # Store interaction
+        return response
+
+    def get_memory(self):
+        return "\n".join(self.memory)
+
+
+# --- 4. Agent Swarm Coordinator ---
+
+class AgentSwarm:
+    def __init__(self, agents):
+        self.agents = agents
+        self.conversation_history = ""
+        self.lock = threading.Lock()  # Protect shared resources
+
+    def orchestrate(self, user_input, num_agents_to_involve=2):
+        """Orchestrates the interaction of multiple agents."""
+
+        # Select agents randomly (can be improved with more sophisticated selection logic)
+        selected_agents = random.sample(self.agents, min(num_agents_to_involve, len(self.agents)))
+        print(f"Engaging agents: {[agent.name for agent in selected_agents]}")
+
+        responses = {}
+        threads = []
+        response_queue = queue.Queue()  # Queue to collect agent responses
+
+        def agent_task(agent, user_input, conversation_history):
+            """Task for each agent to respond."""
+            response = agent.respond(user_input, conversation_history)
+            response_queue.put((agent.name, response))
+
+        # Start threads for each selected agent
+        for agent in selected_agents:
+            thread = threading.Thread(target=agent_task, args=(agent, user_input, self.conversation_history))
+            threads.append(thread)
+            thread.start()
+
+        # Wait for all agents to respond (with a timeout)
+        for thread in threads:
+            thread.join(timeout=10) # Adjust timeout as needed
+
+        # Collect responses from the queue
+        while not response_queue.empty():
+            agent_name, response = response_queue.get()
+            responses[agent_name] = response
+
+        # Aggregate responses (very basic aggregation)
+        aggregated_response = "\n".join([f"{name}: {resp}" for name, resp in responses.items()])
+
+        # Update conversation history
+        with self.lock:
+            self.conversation_history += f"User: {user_input}\n{aggregated_response}\n"
+
+        return aggregated_response
+
+
+# --- 5. Create Agents and Swarm ---
+
+# Example agents:
+agent1 = Agent("Alice", "Question Answering Expert", knowledge_base="limited information on general knowledge")
+agent2 = Agent("Bob", "Creative Writer", personality="imaginative and humorous")
+agent3 = Agent("Charlie", "Technical Assistant", knowledge_base="limited programming knowledge")
+
+swarm = AgentSwarm([agent1, agent2, agent3])
+
+# --- 6. Main Interaction Loop ---
+
+if __name__ == "__main__":
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "exit":
+            break
+
+        response = swarm.orchestrate(user_input)
+        print("Swarm:", response)
